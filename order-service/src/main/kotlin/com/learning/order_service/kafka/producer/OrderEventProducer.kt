@@ -12,7 +12,8 @@ class OrderEventProducer(
     private val logger = LoggerFactory.getLogger(OrderEventProducer::class.java)
 
     companion object {
-        const val ORDER_CREATED_TOPIC = "order_created"
+        const val ORDER_CREATED_TOPIC = "order-created"
+        const val ORDER_CONFIRMED_TOPIC = "order-confirmed"
     }
 
     fun publishOrderCreated(orderCreatedEvent: OrderCreatedEvent){
