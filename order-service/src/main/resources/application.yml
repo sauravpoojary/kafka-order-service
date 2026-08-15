@@ -25,5 +25,17 @@ spring:
         enable.idempotence: true
         max.in.flight.requests.per.connection: 5
 
+    consumer:
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        spring.json.trusted.packages: com.learning.order_service.event
+
+      listener:
+        ack-mode: manual
+        concurrency: 3
+
 server:
   port: 8080

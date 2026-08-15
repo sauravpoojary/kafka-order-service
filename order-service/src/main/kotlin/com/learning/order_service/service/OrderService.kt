@@ -28,21 +28,23 @@ class OrderService(
             amount = createOrderRequest.amount
         )
 
-        val savedOrder = orderRepository.save(order)
+        val saved = orderRepository.save(order)
 
-        logger.info("Order persisted id={} reference={}", savedOrder.id, savedOrder.orderReference)
+        logger.info("Order persisted id={} reference={}", saved.id, saved.orderReference)
 
-        orderEventProducer.publishOrderCreated(
+        orderEventProducer.publish(
+            OrderEventProducer.ORDER_CREATED_TOPIC,
+            saved.orderReference.toString(),
             OrderCreatedEvent(
-                orderReference = savedOrder.orderReference,
-                customerId = savedOrder.customerId,
-                productName = savedOrder.productName,
-                quantity = savedOrder.quantity,
-                amount = savedOrder.amount
+                orderReference = saved.orderReference,
+                customerId = saved.customerId,
+                productName = saved.productName,
+                quantity = saved.quantity,
+                amount = saved.amount
             )
         )
 
-        return OrderResponse.fromEntity(savedOrder)
+        return OrderResponse.fromEntity(saved)
 
     }
 }
