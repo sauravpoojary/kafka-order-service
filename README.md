@@ -34,20 +34,34 @@ A single Spring Boot app simulating a small event-driven system:
  [Client]
     │  POST /api/v1/orders
     ▼
-[OrderController] → [OrderService] ──save──► [Postgres: orders table] (status=PENDING)
-                            │
-                            └──publish──► topic: order-created
-                                                │
-                                                ▼
-                                    [NotificationListener]
-                                    (simulates sending confirmation)
-                                                │
-                                                └──publish──► topic: order-confirmed
+[OrderController] → [OrderService] ──ONE transaction──► [Postgres: orders table]      (status=PENDING)
+                                                     └──► [Postgres: outbox_events]    (status=PENDING)
+                                                                    │
+                                                        [OutboxPublisher] (@Scheduled, every 2s)
+                                                                    │  reads PENDING rows, publishes,
+                                                                    │  marks PUBLISHED only after Kafka acks
+                                                                    ▼
+                                                        topic: order-created
                                                                     │
                                                                     ▼
-                                                        [OrderConfirmationListener]
-                                                        updates DB status → CONFIRMED
+                                                        [NotificationListener]
+                                                        (simulates sending confirmation)
+                                                                    │
+                                                                    └──publish──► topic: order-confirmed
+                                                                                        │
+                                                                                        ▼
+                                                                            [OrderConfirmationListener]
+                                                                            updates DB status → CONFIRMED
 ```
+
+**Why the outbox instead of publishing directly from `OrderService`:** the DB write and the Kafka
+publish used to be two separate, un-linked operations — if the process crashed between them, the
+order stayed `PENDING` forever with no event ever published, silently. Now the order row and the
+outbox row are written in the **same DB transaction**, so they always succeed or fail together;
+a background poller handles the actual Kafka publish and only marks the outbox row `PUBLISHED`
+once Kafka confirms. Verified live by killing the Kafka container mid-flow — the order still
+persisted, the outbox row sat `PENDING` and retried, and self-healed to `PUBLISHED` the moment
+Kafka came back, with zero manual replay.
 
 Two Kafka consumer groups (`notification-service-group`, `order-status-update-group`)
 simulate what would be two separate microservices in a real system, kept in one module
@@ -66,9 +80,12 @@ kafka-order-pipeline/          <- repo root
         ├── OrderServiceApplication.kt
         ├── domain/
         │   ├── Order.kt              (JPA entity — plain class, not data class)
-        │   └── OrderStatus.kt        (enum: PENDING, CONFIRMED, FAILED)
+        │   ├── OrderStatus.kt        (enum: PENDING, CONFIRMED, FAILED)
+        │   ├── OutboxEvent.kt        (transactional outbox row)
+        │   └── OutboxStatus.kt       (enum: PENDING, PUBLISHED, FAILED)
         ├── repository/
-        │   └── OrderRepository.kt    (findByOrderReference, updateStatus)
+        │   ├── OrderRepository.kt    (findByOrderReference, updateStatus)
+        │   └── OutboxEventRepository.kt
         ├── dto/
         │   ├── CreateOrderRequest.kt (validated API input)
         │   └── OrderResponse.kt      (API output, never expose entity directly)
@@ -76,13 +93,17 @@ kafka-order-pipeline/          <- repo root
         │   ├── OrderCreatedEvent.kt  (Kafka payload — separate from entity/DTO)
         │   └── OrderConfirmedEvent.kt
         ├── service/
-        │   └── OrderService.kt       (business logic, ties DB + Kafka together)
+        │   └── OrderService.kt       (business logic; writes order + outbox row in ONE transaction)
         ├── controller/
         │   ├── OrderController.kt
         │   └── GlobalExceptionHandler.kt (@RestControllerAdvice, clean error JSON)
         └── kafka/
+            ├── config/
+            │   └── KafkaErrorHandlingConfig.kt  (DefaultErrorHandler + DeadLetterPublishingRecoverer)
+            ├── outbox/
+            │   └── OutboxPublisher.kt    (@Scheduled poller: outbox row → Kafka, marks PUBLISHED)
             ├── producer/
-            │   └── OrderEventProducer.kt   (generic publish(topic, key, event))
+            │   └── OrderEventProducer.kt   (publish() async + publishSync() for the outbox poller)
             └── consumer/
                 ├── NotificationListener.kt
                 └── OrderConfirmationListener.kt
@@ -157,15 +178,21 @@ curl -X POST http://localhost:8080/api/v1/orders \
 
 ## 7. Known Gaps / Deliberate Simplifications (flagged along the way)
 
-- **Dual-write problem**: DB save and Kafka publish aren't atomic. If the publish fails after
-  the DB commit succeeds, the order stays `PENDING` forever with no retry — a real production
-  system would use the **Outbox Pattern** to fix this. Out of scope for this 3-hour project,
-  but worth knowing exists.
 - **`ddl-auto: update`**: convenient for this learning project, but doesn't rewrite existing
   constraints (this bit us — see debugging log). Real production uses `validate` +
   Flyway/Liquibase migrations.
-- **No tests yet** — Testcontainers-based integration tests are a good next step beyond
-  Phase 4.
+- **Outbox is polling-based, not CDC-based**: `OutboxPublisher` polls every 2s. This adds a
+  latency floor and idle DB load. The more advanced production version uses Change Data
+  Capture (e.g., Debezium reading Postgres's WAL) to publish the instant a row commits, with
+  zero polling. Worth knowing the name; not built here.
+- **`order-confirmed` (from `NotificationListener`) isn't outboxed** — that publish doesn't
+  pair with a DB write the same way `order-created` does, so the dual-write risk doesn't
+  apply there in the same shape.
+- **Idempotent consumers**: `OrderConfirmationListener` is naturally idempotent (safe to
+  re-run). `NotificationListener` is not — a real notification provider call would double-send
+  on redelivery. Real fix: a `processed_events` table with a unique constraint, checked in the
+  same transaction as the side effect. Not implemented (time-boxed).
+- **No tests yet** — Testcontainers-based integration tests are the natural next step.
 
 ---
 
@@ -220,9 +247,9 @@ include `%X{orderReference}`.
 | Area | This project | Real production would add |
 |---|---|---|
 | DB writes | JPA, transactional service layer | Same — already production-shaped |
-| Event publishing | Idempotent producer, keyed messages | **Outbox pattern** — DB write + Kafka publish aren't atomic here; a crash between them silently loses the event |
+| Event publishing | **Outbox pattern** — DB write + outbox row in one transaction, poller publishes and confirms | Same shape; would likely swap polling for CDC (Debezium) to remove the latency floor |
 | Event payloads | Hand-written `data class` + JSON | **Schema registry** (Avro/Protobuf) — enforces producer/consumer contract |
-| Consumer resilience | Manual ack, retry + backoff, DLT | Same — solid as-is |
+| Consumer resilience | Manual ack, retry + backoff, DLT — verified live | Same — solid as-is |
 | Schema management | `ddl-auto: update` | **Flyway/Liquibase** — versioned migrations (this bit us directly, see debugging log) |
 | Testing | None yet | **Testcontainers** — real Kafka + Postgres in tests, not mocks |
 | Service boundaries | One module, two listener "personas" | Separate deployables with independent repos/pipelines |
@@ -230,7 +257,36 @@ include `%X{orderReference}`.
 
 ---
 
-*Final status: full pipeline (REST → DB → Kafka → consumer → DB update) works end-to-end,
-with retry + DLT recovery verified live on a forced failure, and correlation-ID logging in
-place. Project complete for this learning session — see table above for the deliberate
-production gaps and what closes each one.*
+## 11. Outbox Pattern — Implementation Notes
+
+**Files added:**
+- `domain/OutboxEvent.kt`, `domain/OutboxStatus.kt` — generic event-agnostic table:
+  `payload` stored as a JSON string, `eventType` as a string tag, so new event types don't
+  require schema changes
+- `repository/OutboxEventRepository.kt` — `findByStatusOrderByCreatedAtAsc` with `Pageable`
+  to cap batch size per poll cycle
+- `kafka/outbox/OutboxPublisher.kt` — `@Scheduled(fixedDelay = 2000)` poller; publishes
+  **synchronously** (`publishSync`, blocks on `.get()`) so it only marks a row `PUBLISHED`
+  after Kafka actually confirms, not optimistically
+- `OrderService.kt` — no longer touches Kafka at all; writes the `Order` row and the
+  `OutboxEvent` row in the same `@Transactional` method
+- `OrderServiceApplication.kt` — added `@EnableScheduling` (required for `@Scheduled` to run
+  at all — silently no-ops without it, no error)
+
+**Verified live (crash test):**
+```bash
+docker stop kafka
+curl -X POST http://localhost:8080/api/v1/orders -d "..."   # order saves fine
+# outbox_events row: status=PENDING, attempt_count climbing
+docker start kafka
+# within ~2-10s: status flips to PUBLISHED automatically, no manual replay
+```
+This is the actual proof the dual-write gap is closed — not just claimed.
+
+---
+
+*Final status: full pipeline (REST → transactional outbox → Kafka → consumer → DB update)
+works end-to-end, survives a real Kafka outage without data loss (outbox self-heals), and has
+retry + DLT recovery verified live on a forced consumer failure, with correlation-ID logging
+throughout. Natural next steps: Testcontainers integration test, or split into a second
+microservice module for real service boundaries.*
