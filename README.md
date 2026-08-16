@@ -184,21 +184,53 @@ not a sanitized happy path.
 
 ---
 
-## 9. Roadmap (remaining phases)
+## 9. Phase 4 — Production Hardening (done)
 
-- **Phase 4 — Production hardening**
-  - Wire `DeadLetterPublishingRecoverer` so permanently-failed consumer messages actually
-    land in `order-created-dlt` / `order-confirmed-dlt` instead of vanishing after retries
-    exhaust
-  - Retry policy tuning (backoff, max attempts)
-  - Idempotent consumer handling (avoid double-processing on redelivery)
-  - Structured logging / correlation IDs
-- **Phase 5 — Wrap-up**
-  - What we'd add next: Outbox pattern, schema registry, Testcontainers-based integration
-    tests, splitting into separate microservices/modules, distributed tracing
+Added `kafka/config/KafkaErrorHandlingConfig.kt`:
+- `DeadLetterPublishingRecoverer` — routes permanently-failed messages to `<topic>-dlt`,
+  using partition `-1` (let Kafka assign) since DLT topics have fewer partitions (1) than
+  source topics (3) — publishing to a fixed partition index would fail on mismatch
+- `DefaultErrorHandler` with `FixedBackOff(1000L, 3L)` — 3 retries, 1s apart, then recover
+  to DLT. Wired automatically into every `@KafkaListener` by Spring Boot autoconfiguration
+  (detects the single `DefaultErrorHandler` bean, no per-listener config needed)
+- `DeserializationException` marked non-retryable — malformed bytes fail identically every
+  time, so skip straight to DLT instead of wasting 3 retries
+
+**Verified live**: forced `OrderConfirmationListener` to throw, watched 3 retries in logs,
+confirmed the message landed in `order-confirmed-dlt` via Kafka UI with diagnostic headers
+(`kafka_dlt-exception-message`, `kafka_dlt-original-topic`, etc.), confirmed consumer group
+lag returned to 0 despite the failure (offset commits after recovery, not just success).
+Reverted the forced failure and reconfirmed the happy path still works end-to-end.
+
+**Idempotency** — noted but not fully implemented (time-boxed):
+- `OrderConfirmationListener` is naturally idempotent (`updateStatus` is safe to re-run)
+- `NotificationListener` is not (a real notification provider call would double-send on
+  redelivery) — real fix is a `processed_events` table with a unique constraint, checked in
+  the same transaction as the side effect
+
+**Structured logging** — `MDC.put("orderReference", ...)` in both listeners, wrapped in
+`try/finally { MDC.clear() }` (mandatory — thread pools reuse threads across messages, so a
+missing `clear()` leaks one order's ID into unrelated log lines). Logback pattern updated to
+include `%X{orderReference}`.
 
 ---
 
-*Status as of last session: happy path (REST → DB → Kafka → consumer → DB update) works
-end-to-end after fixing the port conflict, Jackson version mismatch, topic name mismatch,
-trusted-packages mismatch, and stale check constraint. Ready to resume at Phase 4.*
+## 10. Phase 5 — Wrap-up / What's Genuinely Production-Grade vs. Deliberate Shortcuts
+
+| Area | This project | Real production would add |
+|---|---|---|
+| DB writes | JPA, transactional service layer | Same — already production-shaped |
+| Event publishing | Idempotent producer, keyed messages | **Outbox pattern** — DB write + Kafka publish aren't atomic here; a crash between them silently loses the event |
+| Event payloads | Hand-written `data class` + JSON | **Schema registry** (Avro/Protobuf) — enforces producer/consumer contract |
+| Consumer resilience | Manual ack, retry + backoff, DLT | Same — solid as-is |
+| Schema management | `ddl-auto: update` | **Flyway/Liquibase** — versioned migrations (this bit us directly, see debugging log) |
+| Testing | None yet | **Testcontainers** — real Kafka + Postgres in tests, not mocks |
+| Service boundaries | One module, two listener "personas" | Separate deployables with independent repos/pipelines |
+| Observability | MDC correlation IDs in app logs | Distributed tracing (OpenTelemetry) across service boundaries |
+
+---
+
+*Final status: full pipeline (REST → DB → Kafka → consumer → DB update) works end-to-end,
+with retry + DLT recovery verified live on a forced failure, and correlation-ID logging in
+place. Project complete for this learning session — see table above for the deliberate
+production gaps and what closes each one.*
