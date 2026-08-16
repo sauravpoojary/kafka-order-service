@@ -3,6 +3,7 @@ package com.learning.order_service.kafka.producer
 import org.slf4j.LoggerFactory
 import org.springframework.kafka.core.KafkaTemplate
 import org.springframework.stereotype.Component
+import java.util.concurrent.TimeUnit
 
 @Component
 class OrderEventProducer(
@@ -27,5 +28,11 @@ class OrderEventProducer(
                     )
                 }
             }
+    }
+
+    fun publishSync(topic: String, key: String, event: Any) {
+        // .get() blocks until Kafka acks or throws — the poller needs to KNOW
+        // it succeeded before marking the outbox row PUBLISHED.
+        kafkaTemplate.send(topic, key, event).get(5, TimeUnit.SECONDS)
     }
 }
